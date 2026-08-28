@@ -1,20 +1,24 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
+	"time"
 
+	appconfig "github.com/juanchopalen/tallerp-telemetry/internal/config"
+	"github.com/juanchopalen/tallerp-telemetry/internal/delivery"
+	"github.com/juanchopalen/tallerp-telemetry/internal/health"
 	telemetryserver "github.com/juanchopalen/tallerp-telemetry/internal/server"
+	"github.com/juanchopalen/tallerp-telemetry/internal/spool"
 	"github.com/juanchopalen/tallerp-telemetry/internal/telemetry"
 )
-
-const defaultPort = 8899
 
 func main() {
 	if err := run(); err != nil {
@@ -24,51 +28,76 @@ func main() {
 }
 
 func run() error {
-	port, err := configuredPort(os.Getenv("TALLERP_TELEMETRY_PORT"))
+	configuration, err := appconfig.Load()
 	if err != nil {
 		return err
 	}
 	logger := telemetry.NewLogger(os.Stdout, slog.LevelInfo)
-	address := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
+	queue, err := spool.Open(configuration.SpoolPath)
+	if err != nil {
+		return fmt.Errorf("open durable spool: %w", err)
+	}
+	defer func() {
+		if queue != nil {
+			_ = queue.Close()
+		}
+	}()
+	metrics := &telemetry.Metrics{}
+	serverConfig := telemetryserver.DefaultConfig()
+	serverConfig.EventSink = queue
+	serverConfig.Metrics = metrics
+	server := telemetryserver.New(serverConfig, logger)
+	address := fmt.Sprintf("0.0.0.0:%d", configuration.TelemetryPort)
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", address, err)
 	}
-
-	server := telemetryserver.New(telemetryserver.DefaultConfig(), logger)
+	healthAddress := fmt.Sprintf("0.0.0.0:%d", configuration.HealthPort)
+	healthServer, err := health.New(healthAddress, server.Ready, queue)
+	if err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("listen health on %s: %w", healthAddress, err)
+	}
+	worker := delivery.New(delivery.Config{APIURL: configuration.APIURL, Token: configuration.TelemetryToken, BatchSize: configuration.DeliveryBatchSize, Interval: configuration.DeliveryInterval, Retention: configuration.SpoolRetention, CriticalPending: configuration.CriticalPending}, queue, &http.Client{Timeout: configuration.HTTPTimeout}, logger, metrics)
+	worker.Start(context.Background())
 	serveErrors := make(chan error, 1)
 	go func() { serveErrors <- server.Serve(listener) }()
+	healthErrors := make(chan error, 1)
+	go func() { healthErrors <- healthServer.Serve() }()
 	logger.Info("telemetry server listening", "event", "server_listening", "address", address)
+	logger.Info("health server listening", "event", "health_listening", "address", healthAddress)
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
+	var runErr error
 	select {
 	case receivedSignal := <-signals:
 		logger.Info("telemetry server stopping", "event", "server_stopping", "signal", receivedSignal.String())
-		if err := server.Close(); err != nil {
-			return fmt.Errorf("close server: %w", err)
-		}
-		if err := <-serveErrors; err != nil && !errors.Is(err, net.ErrClosed) {
-			return fmt.Errorf("serve TCP: %w", err)
-		}
-		return nil
 	case err := <-serveErrors:
-		_ = server.Close()
 		if err != nil && !errors.Is(err, net.ErrClosed) {
-			return fmt.Errorf("serve TCP: %w", err)
+			runErr = fmt.Errorf("serve TCP: %w", err)
 		}
-		return nil
+	case err := <-healthErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			runErr = fmt.Errorf("serve health: %w", err)
+		}
 	}
-}
-
-func configuredPort(raw string) (int, error) {
-	if raw == "" {
-		return defaultPort, nil
+	if err := server.Close(); err != nil && runErr == nil {
+		runErr = fmt.Errorf("close server: %w", err)
 	}
-	port, err := strconv.Atoi(raw)
-	if err != nil || port < 1 || port > 65535 {
-		return 0, fmt.Errorf("TALLERP_TELEMETRY_PORT must be an integer from 1 to 65535")
+	shutdownContext, cancel := context.WithTimeout(context.Background(), max(15*time.Second, configuration.HTTPTimeout+5*time.Second))
+	defer cancel()
+	if err := worker.Shutdown(shutdownContext); err != nil && runErr == nil {
+		runErr = fmt.Errorf("stop delivery worker: %w", err)
 	}
-	return port, nil
+	if err := healthServer.Shutdown(shutdownContext); err != nil && runErr == nil {
+		runErr = fmt.Errorf("stop health server: %w", err)
+	}
+	closeSpoolErr := queue.Close()
+	queue = nil
+	if closeSpoolErr != nil && runErr == nil {
+		runErr = fmt.Errorf("close durable spool: %w", closeSpoolErr)
+	}
+	return runErr
 }

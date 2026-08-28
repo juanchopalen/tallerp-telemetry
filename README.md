@@ -3,14 +3,16 @@
 Servidor TCP en Go para recibir directamente telemetría de trackers GPS que
 usan la variante GT06 documentada en `docs/GT06 Protocol 230225.pdf`.
 
-La primera fase implementa framing TCP, CRC-ITU, login (`0x01`), posiciones
-GPS/LBS (`0x12`), heartbeat (`0x13`) y alarmas (`0x16`). No usa base de datos,
-Laravel, Smake API ni una API HTTP.
+Implementa framing TCP, CRC-ITU, login (`0x01`), posiciones GPS/LBS (`0x12`),
+heartbeat (`0x13`) y alarmas (`0x16`). Cada evento válido se guarda primero en
+un spool SQLite durable y un worker independiente lo entrega por lotes a la API
+interna de Laravel. Los ACK del tracker nunca esperan una respuesta de Laravel.
 
 ## Requisitos
 
 - Go 1.27 o posterior.
 - Un puerto TCP disponible. El valor predeterminado es `8899`.
+- Un directorio escribible para SQLite.
 
 ## Desarrollo
 
@@ -20,10 +22,10 @@ Ejecutar todas las pruebas:
 go test ./...
 ```
 
-Iniciar el servidor en el puerto predeterminado:
+Para desarrollo, usar un spool local e iniciar el servidor:
 
 ```bash
-go run ./cmd/server
+TALLERP_SPOOL_PATH=./spool.db go run ./cmd/server
 ```
 
 Elegir otro puerto:
@@ -32,8 +34,26 @@ Elegir otro puerto:
 TALLERP_TELEMETRY_PORT=9000 go run ./cmd/server
 ```
 
-El listener se enlaza a `0.0.0.0:<puerto>`. La variable debe contener un entero
-entre `1` y `65535`.
+Los listeners TCP y health se enlazan a `0.0.0.0`. Todas las opciones están en
+[`.env.example`](.env.example); el binario lee variables de entorno, no carga
+automáticamente archivos `.env`.
+
+## Entrega durable
+
+SQLite usa WAL y conserva eventos pendientes a través de reinicios. Los eventos
+entregados se eliminan después de la retención configurada; los pendientes no
+se eliminan por antigüedad. El worker envía lotes a
+`POST /api/internal/telemetry/events`, acepta IDs nuevos y duplicados como
+entregados y reintenta fallos con backoff exponencial y jitter. El contrato que
+Laravel debe implementar está en
+[`docs/laravel-ingestion-api.md`](docs/laravel-ingestion-api.md).
+
+Endpoints operativos:
+
+- `GET /health`: el proceso está vivo;
+- `GET /ready`: el listener TCP está activo y SQLite responde y admite escritura.
+
+La disponibilidad de Laravel no afecta `/ready`.
 
 ## Prueba manual
 
@@ -88,7 +108,7 @@ validan como frames y se registran sin cerrar la conexión:
 - `0x90`: IMSI;
 - `0x94`: ICCID e información general.
 
-## Producción inicial
+## Producción con systemd
 
 Compilar el binario local:
 
@@ -96,11 +116,17 @@ Compilar el binario local:
 go build -o tallerp-telemetry ./cmd/server
 ```
 
-Ejecutarlo:
+Crear el usuario y el directorio durable antes de iniciar el servicio:
 
 ```bash
-TALLERP_TELEMETRY_PORT=8899 ./tallerp-telemetry
+sudo useradd --system --home /var/lib/tallerp-telemetry --shell /usr/sbin/nologin tallerp-telemetry
+sudo install -d -o tallerp-telemetry -g tallerp-telemetry -m 0750 /var/lib/tallerp-telemetry
 ```
+
+El proceso debe ejecutarse como `tallerp-telemetry`. Ese usuario necesita crear
+y modificar `spool.db`, `spool.db-wal` y `spool.db-shm`. Cargue las variables de
+`.env.example` mediante `EnvironmentFile=` y mantenga el token fuera del
+repositorio.
 
 Compilar para Ubuntu ARM64:
 
@@ -110,4 +136,3 @@ GOOS=linux GOARCH=arm64 go build -o tallerp-telemetry ./cmd/server
 
 El proceso responde a `SIGINT` y `SIGTERM`, cierra el listener y termina las
 conexiones activas de forma ordenada.
-

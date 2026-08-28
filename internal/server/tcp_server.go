@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/juanchopalen/tallerp-telemetry/internal/protocol"
+	"github.com/juanchopalen/tallerp-telemetry/internal/telemetry"
 )
 
 type Config struct {
@@ -15,6 +16,8 @@ type Config struct {
 	WriteTimeout     time.Duration
 	MaxFrameSize     int
 	MaxBufferedBytes int
+	EventSink        telemetry.Sink
+	Metrics          *telemetry.Metrics
 }
 
 func DefaultConfig() Config {
@@ -27,8 +30,10 @@ func DefaultConfig() Config {
 }
 
 type Server struct {
-	config Config
-	logger *slog.Logger
+	config  Config
+	logger  *slog.Logger
+	sink    telemetry.Sink
+	metrics *telemetry.Metrics
 
 	mu          sync.Mutex
 	listener    net.Listener
@@ -58,11 +63,22 @@ func New(config Config, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if config.Metrics == nil {
+		config.Metrics = &telemetry.Metrics{}
+	}
 	return &Server{
 		config:      config,
 		logger:      logger,
+		sink:        config.EventSink,
+		metrics:     config.Metrics,
 		connections: make(map[net.Conn]struct{}),
 	}
+}
+
+func (s *Server) Ready() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listener != nil && !s.closing
 }
 
 func (s *Server) Serve(listener net.Listener) error {

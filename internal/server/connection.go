@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,8 @@ import (
 	"time"
 
 	"github.com/juanchopalen/tallerp-telemetry/internal/protocol"
+	"github.com/juanchopalen/tallerp-telemetry/internal/spool"
+	"github.com/juanchopalen/tallerp-telemetry/internal/telemetry"
 )
 
 type ConnectionContext struct {
@@ -17,6 +20,8 @@ type ConnectionContext struct {
 }
 
 func (s *Server) handleConnection(connection net.Conn) {
+	s.metrics.ConnectionsActive.Add(1)
+	defer s.metrics.ConnectionsActive.Add(-1)
 	remote := connection.RemoteAddr().String()
 	remoteIP := remote
 	if host, _, err := net.SplitHostPort(remote); err == nil {
@@ -66,6 +71,9 @@ func (s *Server) handleConnection(connection net.Conn) {
 			receivedAt := time.Now().UTC()
 			frames, decodeErrors := decoder.Push(readBuffer[:readBytes])
 			for _, decodeError := range decodeErrors {
+				if errors.Is(decodeError, protocol.ErrInvalidCRC) {
+					s.metrics.InvalidCRC.Add(1)
+				}
 				s.logger.Warn("invalid tracker frame",
 					"event", decodeEvent(decodeError),
 					"remote", remote,
@@ -76,6 +84,7 @@ func (s *Server) handleConnection(connection net.Conn) {
 				)
 			}
 			for _, frame := range frames {
+				s.metrics.FramesReceived.Add(1)
 				if processErr := s.processFrame(connection, context, remote, frame, receivedAt); processErr != nil {
 					disconnectError = processErr
 					s.logSocketError(context, remote, processErr)
@@ -134,6 +143,7 @@ func (s *Server) processFrame(connection net.Conn, context *ConnectionContext, r
 			"imei", packet.IMEI,
 			"ack_hex", protocol.Hex(ack),
 		)...)
+		s.persist(telemetry.TelemetryEvent{EventType: "login", IMEI: packet.IMEI, Protocol: "0x01", Serial: packet.Serial, ReceivedAt: receivedAt, RawHex: protocol.Hex(frame.Raw)})
 	case 0x12:
 		packet, err := protocol.ParseLocation(frame, context.IMEI)
 		if err != nil {
@@ -141,6 +151,7 @@ func (s *Server) processFrame(connection net.Conn, context *ConnectionContext, r
 			return nil
 		}
 		received := protocol.ReceivedLocation{Location: packet, ReceivedAt: receivedAt}
+		s.metrics.LocationsReceived.Add(1)
 		s.logger.Info("tracker location", append(common,
 			"event", "location",
 			"imei", packet.IMEI,
@@ -159,6 +170,8 @@ func (s *Server) processFrame(connection net.Conn, context *ConnectionContext, r
 			"lac", packet.LAC,
 			"cell_id", packet.CellID,
 		)...)
+		speed := float64(packet.SpeedKmh)
+		s.persist(telemetry.TelemetryEvent{EventType: "location", IMEI: packet.IMEI, Protocol: "0x12", Serial: packet.Serial, GPSAt: &packet.GPSAt, ReceivedAt: receivedAt, Latitude: &packet.Latitude, Longitude: &packet.Longitude, SpeedKmh: &speed, Heading: &packet.Heading, Satellites: &packet.Satellites, GPSLocated: &packet.GPSLocated, RealtimeGPS: &packet.RealtimeGPS, ACC: packet.ACC, RawHex: protocol.Hex(frame.Raw)})
 	case 0x13:
 		packet, err := protocol.ParseHeartbeat(frame, context.IMEI)
 		if err != nil {
@@ -172,6 +185,7 @@ func (s *Server) processFrame(connection net.Conn, context *ConnectionContext, r
 		if err := s.writeACK(connection, ack); err != nil {
 			return err
 		}
+		s.metrics.HeartbeatsReceived.Add(1)
 		s.logger.Info("tracker heartbeat", append(common,
 			"event", "heartbeat",
 			"imei", packet.IMEI,
@@ -184,6 +198,7 @@ func (s *Server) processFrame(connection net.Conn, context *ConnectionContext, r
 			"language", packet.Language,
 			"ack_hex", protocol.Hex(ack),
 		)...)
+		s.persist(telemetry.TelemetryEvent{EventType: "heartbeat", IMEI: packet.IMEI, Protocol: "0x13", Serial: packet.Serial, ReceivedAt: receivedAt, GPSLocated: &packet.GPSLocated, ACC: &packet.ACC, GSMSignal: &packet.GSMSignal, VoltageLevel: &packet.VoltageLevel, RawHex: protocol.Hex(frame.Raw)})
 	case 0x16:
 		packet, err := protocol.ParseAlarm(frame, context.IMEI)
 		if err != nil {
@@ -213,13 +228,33 @@ func (s *Server) processFrame(connection net.Conn, context *ConnectionContext, r
 			"gsm_signal", packet.GSMSignal,
 			"ack_hex", protocol.Hex(ack),
 		)...)
+		speed := float64(packet.SpeedKmh)
+		s.persist(telemetry.TelemetryEvent{EventType: "alarm", IMEI: packet.IMEI, Protocol: "0x16", Serial: packet.Serial, GPSAt: &packet.GPSAt, ReceivedAt: receivedAt, Latitude: &packet.Latitude, Longitude: &packet.Longitude, SpeedKmh: &speed, Heading: &packet.Heading, Satellites: &packet.Satellites, GPSLocated: &packet.GPSLocated, ACC: &packet.ACC, GSMSignal: &packet.GSMSignal, VoltageLevel: &packet.VoltageLevel, RawHex: protocol.Hex(frame.Raw)})
 	default:
+		s.metrics.UnsupportedProtocol.Add(1)
 		s.logger.Warn("unsupported tracker protocol", append(common,
 			"event", "unsupported_protocol",
 			"imei", context.IMEI,
 		)...)
 	}
 	return nil
+}
+
+func (s *Server) persist(event telemetry.TelemetryEvent) {
+	if s.sink == nil {
+		return
+	}
+	event.SetID()
+	inserted, err := s.sink.Store(context.Background(), event)
+	if err != nil {
+		level := "ERROR"
+		if spool.IsDiskFull(err) {
+			level = "CRITICAL"
+		}
+		s.logger.Error("telemetry persistence failure", "event", "telemetry_persistence_failure", "severity", level, "event_id", event.EventID, "imei", event.IMEI, "protocol", event.Protocol, "error", err)
+		return
+	}
+	s.logger.Debug("telemetry persisted", "event", "telemetry_persisted", "event_id", event.EventID, "inserted", inserted)
 }
 
 func (s *Server) writeACK(connection net.Conn, ack []byte) error {
