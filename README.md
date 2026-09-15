@@ -140,6 +140,9 @@ validan como frames y se registran sin cerrar la conexión:
 
 ## Producción con systemd
 
+El procedimiento completo, incluidas la transferencia del binario, validación
+y rollback, está en [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 Compilar el binario local:
 
 ```bash
