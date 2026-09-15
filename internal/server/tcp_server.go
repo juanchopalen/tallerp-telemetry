@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/juanchopalen/tallerp-telemetry/internal/protocol"
+	"github.com/juanchopalen/tallerp-telemetry/internal/protocol/gt02"
+	"github.com/juanchopalen/tallerp-telemetry/internal/protocol/gt06"
+	"github.com/juanchopalen/tallerp-telemetry/internal/protocol/jt808"
 	"github.com/juanchopalen/tallerp-telemetry/internal/telemetry"
 )
 
@@ -18,6 +21,14 @@ type Config struct {
 	MaxBufferedBytes int
 	EventSink        telemetry.Sink
 	Metrics          *telemetry.Metrics
+
+	// JT808AuthStore persists JT808 terminal auth codes. If nil, JT808
+	// registration/auth fails closed (the handler is still constructed,
+	// but every terminal store lookup errors) rather than silently
+	// disabling the protocol.
+	JT808AuthStore jt808.AuthStore
+	// JT808Debug enables verbose per-frame JT808 diagnostic logging.
+	JT808Debug bool
 }
 
 func DefaultConfig() Config {
@@ -30,10 +41,12 @@ func DefaultConfig() Config {
 }
 
 type Server struct {
-	config  Config
-	logger  *slog.Logger
-	sink    telemetry.Sink
-	metrics *telemetry.Metrics
+	config       Config
+	logger       *slog.Logger
+	sink         telemetry.Sink
+	metrics      *telemetry.Metrics
+	handlers     []protocol.Handler
+	jt808Handler *jt808.Handler
 
 	mu          sync.Mutex
 	listener    net.Listener
@@ -67,11 +80,13 @@ func New(config Config, logger *slog.Logger) *Server {
 		config.Metrics = &telemetry.Metrics{}
 	}
 	return &Server{
-		config:      config,
-		logger:      logger,
-		sink:        config.EventSink,
-		metrics:     config.Metrics,
-		connections: make(map[net.Conn]struct{}),
+		config:       config,
+		logger:       logger,
+		sink:         config.EventSink,
+		metrics:      config.Metrics,
+		handlers:     []protocol.Handler{gt06.NewHandler(), gt02.NewHandler()},
+		jt808Handler: jt808.NewHandler(config.JT808AuthStore),
+		connections:  make(map[net.Conn]struct{}),
 	}
 }
 

@@ -29,6 +29,7 @@ El cuerpo contiene un lote de hasta `TALLERP_DELIVERY_BATCH_SIZE` eventos:
       "event_type": "location",
       "imei": "867111066918621",
       "protocol": "0x12",
+      "protocol_family": "gt06",
       "serial": 14,
       "gps_at": "2026-08-28T16:37:42Z",
       "received_at": "2026-08-28T16:37:44Z",
@@ -46,11 +47,27 @@ El cuerpo contiene un lote de hasta `TALLERP_DELIVERY_BATCH_SIZE` eventos:
 }
 ```
 
-Tipos actuales de `event_type`: `login`, `location`, `heartbeat` y `alarm`.
+Tipos de `event_type`: `login`, `location`, `heartbeat`, `alarm`, `lbs`,
+`wifi`, `general_info` y `command_response`.
 Los campos opcionales se omiten cuando el protocolo no los entrega. Laravel
 debe mantener `gps_at` y `received_at` separados y aceptar eventos históricos o
 fuera de orden. `acc` se conserva, pero por ahora no debe usarse para filtrar
 posiciones ni inferir el estado real del vehículo.
+
+`protocol` continúa siendo el número de mensaje para mantener compatibilidad e
+idempotencia GT06. `protocol_family` es aditivo y vale `gt06` o `gt02`. GT02
+puede añadir los siguientes campos opcionales:
+
+- `external_power`, `is_retransmission` y `alarm_type`;
+- `battery_percent`, `external_voltage`, `mcc`, `mnc` y `timing_advance`;
+- `cells`: observaciones `{lac, cell_id, rssi}`;
+- `wifi_access_points`: observaciones `{mac, signal_strength}`;
+- `general_info`: subtipo y, para `0x0A`, IMEI/IMSI/ICCID;
+- `command_response`: `server_flag`, `encoding` y `content`.
+
+IMSI e ICCID son datos internos sensibles: Laravel puede conservarlos para
+operación del tracker, pero no debe incluirlos en recursos ni respuestas del
+frontend. LBS y WiFi no representan coordenadas calculadas.
 
 Go nunca envía `workshop_id`, `vehicle_id` ni `customer_id`. Laravel resuelve el
 IMEI mediante `vehicle_tracker` y de allí deriva vehículo y tenant. Un IMEI no
@@ -77,7 +94,8 @@ secretos). El servicio limita la respuesta leída a 1 MiB.
 ## Idempotencia y persistencia
 
 `event_id` es un SHA-256 determinístico de IMEI, protocolo, serial, fecha GPS
-cuando existe y paquete crudo. Laravel debe imponer `UNIQUE(event_id)` y tratar
+cuando existe y paquete crudo. Para GT02 también incorpora la familia; la
+fórmula histórica GT06 no cambia. Laravel debe imponer `UNIQUE(event_id)` y tratar
 una colisión con una fila ya insertada como `duplicates`, no como error.
 
 Para `location`, la inserción de la posición y la clasificación del ID deben ser

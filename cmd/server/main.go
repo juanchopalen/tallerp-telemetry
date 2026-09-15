@@ -15,6 +15,7 @@ import (
 	appconfig "github.com/juanchopalen/tallerp-telemetry/internal/config"
 	"github.com/juanchopalen/tallerp-telemetry/internal/delivery"
 	"github.com/juanchopalen/tallerp-telemetry/internal/health"
+	"github.com/juanchopalen/tallerp-telemetry/internal/jt808store"
 	telemetryserver "github.com/juanchopalen/tallerp-telemetry/internal/server"
 	"github.com/juanchopalen/tallerp-telemetry/internal/spool"
 	"github.com/juanchopalen/tallerp-telemetry/internal/telemetry"
@@ -42,10 +43,16 @@ func run() error {
 			_ = queue.Close()
 		}
 	}()
+	jt808Store, err := jt808store.Open(queue.DB())
+	if err != nil {
+		return fmt.Errorf("open jt808 terminal store: %w", err)
+	}
 	metrics := &telemetry.Metrics{}
 	serverConfig := telemetryserver.DefaultConfig()
 	serverConfig.EventSink = queue
 	serverConfig.Metrics = metrics
+	serverConfig.JT808AuthStore = jt808Store
+	serverConfig.JT808Debug = configuration.JT808Debug
 	server := telemetryserver.New(serverConfig, logger)
 	address := fmt.Sprintf("0.0.0.0:%d", configuration.TelemetryPort)
 	listener, err := net.Listen("tcp", address)

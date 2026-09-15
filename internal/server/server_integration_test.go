@@ -2,17 +2,25 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/juanchopalen/tallerp-telemetry/internal/delivery"
 	"github.com/juanchopalen/tallerp-telemetry/internal/protocol"
+	"github.com/juanchopalen/tallerp-telemetry/internal/spool"
+	"github.com/juanchopalen/tallerp-telemetry/internal/telemetry"
 )
 
 const (
@@ -123,15 +131,123 @@ func TestServerAcceptsConcurrentConnections(t *testing.T) {
 	stopTestServer(t, server, serveDone)
 }
 
+func TestGT06AndGT02ShareSpoolAndDeliveryBatch(t *testing.T) {
+	queue, err := spool.Open(filepath.Join(t.TempDir(), "multiprotocol.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+
+	config := DefaultConfig()
+	config.ReadTimeout = 2 * time.Second
+	config.WriteTimeout = time.Second
+	config.EventSink = queue
+	listener, server, serveDone := startTestServerWithConfig(t, config)
+
+	gt06Connection := dialTestServer(t, listener)
+	writeAll(t, gt06Connection, decodeHex(t, loginFrame))
+	assertRead(t, gt06Connection, decodeHex(t, "787805010001d9dc0d0a"))
+	writeAll(t, gt06Connection, decodeHex(t, locationFrame))
+
+	gt02Connection := dialTestServer(t, listener)
+	writeAll(t, gt02Connection, decodeHex(t, "78781101086654505250169628013201000169040d0a"))
+	assertRead(t, gt02Connection, decodeHex(t, "787805010001d9dc0d0a"))
+	writeAll(t, gt02Connection, decodeHex(t, "78782431140813082d04cb026c6f6c0c3713a600140001cc000125fc06146402000000000bcd210d0a"))
+
+	var pending []spool.Item
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pending, err = queue.Pending(context.Background(), 10, time.Now().Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 4 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(pending) != 4 {
+		t.Fatalf("pending events=%d, want 4", len(pending))
+	}
+
+	batchChannel := make(chan []telemetry.TelemetryEvent, 1)
+	api := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Events []telemetry.TelemetryEvent `json:"events"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		batchChannel <- body.Events
+		accepted := make([]string, len(body.Events))
+		for index, event := range body.Events {
+			accepted[index] = event.EventID
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{"accepted": accepted, "duplicates": []string{}, "rejected": []string{}})
+	}))
+	defer api.Close()
+
+	worker := delivery.New(delivery.Config{APIURL: api.URL, BatchSize: 10, Interval: 10 * time.Millisecond}, queue, api.Client(), slog.New(slog.NewJSONHandler(io.Discard, nil)), &telemetry.Metrics{})
+	worker.Start(context.Background())
+	defer worker.Shutdown(context.Background())
+
+	select {
+	case batch := <-batchChannel:
+		if len(batch) != 4 {
+			t.Fatalf("delivered batch=%d, want 4", len(batch))
+		}
+		families := map[string]int{}
+		for _, event := range batch {
+			families[event.ProtocolFamily]++
+		}
+		if families["gt06"] != 2 || families["gt02"] != 2 {
+			t.Fatalf("unexpected protocol families: %v", families)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("multiprotocol batch was not delivered")
+	}
+
+	_ = gt06Connection.Close()
+	_ = gt02Connection.Close()
+	stopTestServer(t, server, serveDone)
+}
+
+func TestProtocolDetectionClosesAfterFourthAmbiguousFrame(t *testing.T) {
+	listener, server, serveDone := startTestServer(t)
+	connection := dialTestServer(t, listener)
+	heartbeat := decodeHex(t, heartbeatFrame)
+	for index := 0; index < 4; index++ {
+		writeAll(t, connection, heartbeat)
+		ack, err := protocol.BuildHeartbeatACK(0x001f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertRead(t, connection, ack)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after ambiguity limit=%v, want EOF", err)
+	}
+	stopTestServer(t, server, serveDone)
+}
+
 func startTestServer(t *testing.T) (net.Listener, *Server, <-chan error) {
+	t.Helper()
+	config := DefaultConfig()
+	config.ReadTimeout = 2 * time.Second
+	config.WriteTimeout = time.Second
+	return startTestServerWithConfig(t, config)
+}
+
+func startTestServerWithConfig(t *testing.T, config Config) (net.Listener, *Server, <-chan error) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := DefaultConfig()
-	config.ReadTimeout = 2 * time.Second
-	config.WriteTimeout = time.Second
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	server := New(config, logger)
 	serveDone := make(chan error, 1)

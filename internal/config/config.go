@@ -20,6 +20,7 @@ type Config struct {
 	DeliveryInterval  time.Duration
 	HTTPTimeout       time.Duration
 	CriticalPending   int64
+	JT808Debug        bool
 }
 
 func Load() (Config, error) {
@@ -74,7 +75,20 @@ func Load() (Config, error) {
 		TelemetryToken:    strings.TrimSpace(os.Getenv("TALLERP_TELEMETRY_TOKEN")),
 		DeliveryBatchSize: batchSize, DeliveryInterval: time.Duration(intervalSeconds) * time.Second,
 		HTTPTimeout: time.Duration(timeoutSeconds) * time.Second, CriticalPending: int64(criticalPending),
+		JT808Debug: boolean("TALLERP_JT808_DEBUG", false),
 	}, nil
+}
+
+func boolean(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func integer(name string, fallback, minimum, maximum int) (int, error) {

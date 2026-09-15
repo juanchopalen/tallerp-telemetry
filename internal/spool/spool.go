@@ -77,6 +77,12 @@ func (s *Spool) initialize(ctx context.Context) error {
 	return nil
 }
 
+// DB exposes the underlying SQLite handle so other durable stores that share
+// this same database file (e.g. internal/jt808store) can piggyback on the
+// connection already opened here instead of opening a second handle against
+// one file.
+func (s *Spool) DB() *sql.DB { return s.db }
+
 func (s *Spool) Store(ctx context.Context, event telemetry.TelemetryEvent) (bool, error) {
 	if event.EventID == "" {
 		event.SetID()

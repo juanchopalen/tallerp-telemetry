@@ -1,12 +1,16 @@
 # TallERP Telemetry
 
-Servidor TCP en Go para recibir directamente telemetría de trackers GPS que
-usan la variante GT06 documentada en `docs/GT06 Protocol 230225.pdf`.
+Servidor TCP en Go para recibir directamente telemetría de trackers GPS/OBD2
+que usan GT06, GT02 y JT808, documentados en `docs/GT06 Protocol 230225.pdf`,
+`docs/GT02.pdf` y el manual JT808 V1.0 del fabricante.
 
-Implementa framing TCP, CRC-ITU, login (`0x01`), posiciones GPS/LBS (`0x12`),
-heartbeat (`0x13`) y alarmas (`0x16`). Cada evento válido se guarda primero en
-un spool SQLite durable y un worker independiente lo entrega por lotes a la API
-interna de Laravel. Los ACK del tracker nunca esperan una respuesta de Laravel.
+Implementa framing TCP y CRC-ITU compartidos para GT06/GT02, y un framing y
+despachador propios para JT808 (delimitado por `0x7E`, con byte-stuffing y
+checksum XOR — incompatible con el decoder de GT06/GT02). La detección de
+protocolo es por conexión y cada familia tiene su handler independiente. Cada
+evento válido se guarda primero en un spool SQLite durable y un worker
+independiente lo entrega por lotes a la API interna de Laravel. Los ACK del
+tracker nunca esperan una respuesta de Laravel.
 
 ## Requisitos
 
@@ -89,14 +93,40 @@ recibidos, errores de socket, CRC inválido y protocolos no soportados.
 
 ## Protocolos
 
-Interpretados en esta fase:
+Familias soportadas en el mismo puerto:
+
+- GT06 / N01K;
+- GT02 / OBD;
+- JT808 / OBD2.
+
+El campo JSON `protocol` conserva el número de mensaje y
+`protocol_family` identifica `gt06`, `gt02` o `jt808`. La sesión fija la
+familia después del login/registro o de un mensaje exclusivo; no se
+redetecta en cada paquete. JT808 se distingue de GT06/GT02 por el primer
+byte del stream (`0x7E` vs. `0x78`/`0x79`). La guía GT02 completa está en
+[`docs/gt02.md`](docs/gt02.md) y la guía JT808 en
+[`docs/jt808.md`](docs/jt808.md).
+
+GT06 interpretado:
 
 - `0x01`: login e IMEI, con ACK;
 - `0x12`: GPS/LBS, sin ACK;
 - `0x13`: heartbeat, con ACK;
 - `0x16`: alarma, con ACK.
 
-El decoder acepta cabeceras `0x7878` y `0x7979`. Los protocolos pendientes se
+GT02 interpretado:
+
+- `0x01`: login con tipo de dispositivo y ACK;
+- `0x31`: GPS/LBS UTC, ACC y transmisión suplementaria;
+- `0x13`: heartbeat y ACK;
+- `0x32`: alarma con ACK `0x26`;
+- `0x34`: LBS multibase;
+- `0x33`: celdas y WiFi;
+- `0x94`: información general, incluido IMEI/IMSI/ICCID;
+- `0x21`: respuesta de comando ASCII o UTF-16BE;
+- `0x80`: construcción de comandos, sin ejecución automática.
+
+El decoder acepta cabeceras `0x7878` y `0x7979`. Otros mensajes GT06 pendientes se
 validan como frames y se registran sin cerrar la conexión:
 
 - `0x15`: respuesta a comando;
